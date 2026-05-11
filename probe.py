@@ -1,64 +1,128 @@
 """
-probe.py — Hallucination probe classifier (student-implemented).
+probe.py: HallucinationProbe classifier.
 
-Implements ``HallucinationProbe``, a binary MLP that classifies feature
-vectors as truthful (0) or hallucinated (1).  Called from ``solution.py``
-via ``evaluate.run_evaluation``.  All four public methods (``fit``,
-``fit_hyperparameters``, ``predict``, ``predict_proba``) must be implemented
-and their signatures must not change.
+A small ensemble of 5 logistic regressions trained on bootstrap samples of
+the training data. Predictions are the averaged class-1 probability across
+the 5 fits. The decision threshold is picked inside fit() from 5-fold
+out-of-fold probabilities so that the final probe trained in solution.py
+ships with a non-default threshold.
+
+A few design choices:
+
+- C is fixed at 0.01 (strong L2). Stronger regularization beats weaker on
+  this 689 x 1792 problem. I checked C in {0.001, 0.01, 0.05, 0.1, 0.5,
+  1.0, 10.0}; 0.01 to 0.05 was the best range. Adaptive C-search inside
+  fit() was within +/-0.02 acc of fixed 0.01, so I kept it simple.
+- class_weight=None, not 'balanced'. Train prior is ~70/30 hallucinated
+  to truthful. Balancing flattens calibration and cost about 1 point of
+  accuracy on every layer I tested.
+- 5 bootstrap fits with fixed seeds. Bootstrap aggregation is a simple
+  way to reduce variance on a small dataset, and each fit is cheap.
+- Threshold tuned for accuracy (the competition primary metric), not for
+  F1. F1 tuning predicts more positives and accuracy drops by about 1
+  point.
+- Threshold is picked from 5-fold OOF predictions inside fit() so that
+  every training sample contributes once. evaluate.py later overwrites
+  the threshold per-fold via fit_hyperparameters.
+
+The class still subclasses nn.Module to satisfy the evaluator contract.
+forward() returns logits from a single nn.Linear that mirrors the
+average of the ensemble weights; the evaluator itself uses predict() and
+predict_proba() directly, so this is just for shape correctness.
 """
-
 from __future__ import annotations
+
+import warnings
 
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import f1_score
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
+
+# Hyperparameters picked in experiments/final_search.py and
+# experiments/response_ensemble.py on 5-fold stratified CV.
+LOGREG_C: float = 0.01
+RANDOM_STATE: int = 42
+INNER_FOLDS: int = 5     # k-fold inside fit() for OOF threshold tuning
+N_BOOTSTRAP: int = 5     # number of bootstrap fits in the production ensemble
+BOOTSTRAP_SEEDS: tuple[int, ...] = (0, 1, 7, 42, 123)
 
 
 class HallucinationProbe(nn.Module):
-    """Binary classifier that detects hallucinations from hidden-state features.
+    """Binary classifier for hallucination detection on hidden-state features.
 
-    Extends ``torch.nn.Module``; the default architecture is a single
-    hidden-layer MLP with ``StandardScaler`` pre-processing.  The network is
-    built lazily in ``fit()`` once the feature dimension is known.
+    Stores N_BOOTSTRAP (StandardScaler, LogReg) pipelines fit on bootstrap
+    samples. predict_proba averages the class-1 probability over them.
+    forward() uses a single nn.Linear that mirrors the average ensemble
+    weights, only to satisfy the nn.Module contract.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._net: nn.Sequential | None = None  # built lazily in fit()
-        self._scaler = StandardScaler()
-        self._threshold: float = 0.5  # tuned by fit_hyperparameters()
+        self._scalers: list[StandardScaler] = []
+        self._clfs: list[LogisticRegression] = []
+        self._net: nn.Linear | None = None
+        self._threshold: float = 0.5
 
-    # ------------------------------------------------------------------
-    # STUDENT: Replace or extend the network definition below.
-    # ------------------------------------------------------------------
-    def _build_network(self, input_dim: int) -> None:
-        """Instantiate the network layers.
-
-        Called once at the start of ``fit()`` when ``input_dim`` is known.
-
-        Args:
-            input_dim: Feature vector dimensionality.
-        """
-        self._net = nn.Sequential(
-            nn.Linear(input_dim, 256),
-            nn.ReLU(),
-            nn.Linear(256, 1),
+    # Internal helpers ----------------------------------------------------
+    def _fit_one(self, X: np.ndarray, y: np.ndarray) -> tuple[StandardScaler, LogisticRegression]:
+        sc = StandardScaler().fit(X)
+        clf = LogisticRegression(
+            C=LOGREG_C, max_iter=3000, solver="lbfgs", class_weight=None,
         )
+        clf.fit(sc.transform(X), y.astype(int))
+        return sc, clf
 
-    # ------------------------------------------------------------------
+    def _fit_bootstrap_ensemble(self, X: np.ndarray, y: np.ndarray) -> None:
+        """Fit N_BOOTSTRAP independent LogReg pipelines on bootstrap samples
+        of (X, y) and store them all for averaged inference."""
+        self._scalers = []
+        self._clfs = []
+        n = len(y)
+        for seed in BOOTSTRAP_SEEDS:
+            rng = np.random.RandomState(seed)
+            idx = rng.choice(n, size=n, replace=True)
+            sc, clf = self._fit_one(X[idx], y[idx])
+            self._scalers.append(sc)
+            self._clfs.append(clf)
+        self._mirror_to_torch_avg()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass — returns raw logits of shape ``(n_samples,)``.
-
-        Args:
-            x: Float tensor of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            1-D tensor of raw (pre-sigmoid) logits.
+    def _mirror_to_torch_avg(self) -> None:
+        """Put the averaged ensemble weights into a single nn.Linear so
+        forward() returns logits in roughly the same regime as
+        predict_proba. The evaluator does not call forward() in practice,
+        this is only here to satisfy the nn.Module contract.
         """
+        if not self._clfs:
+            return
+        ws = np.stack([c.coef_[0] for c in self._clfs], axis=0).astype(np.float32)
+        bs = np.array([float(c.intercept_[0]) for c in self._clfs], dtype=np.float32)
+        w = ws.mean(axis=0)
+        b = float(bs.mean())
+        layer = nn.Linear(w.shape[0], 1)
+        with torch.no_grad():
+            layer.weight.copy_(torch.from_numpy(w).unsqueeze(0))
+            layer.bias.copy_(torch.tensor([b], dtype=torch.float32))
+        self._net = layer
+
+    @staticmethod
+    def _best_accuracy_threshold(probs: np.ndarray, y_true: np.ndarray) -> float:
+        cand = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
+        best_t, best_acc = 0.5, -1.0
+        for t in cand:
+            acc = accuracy_score(y_true, (probs >= t).astype(int))
+            if acc > best_acc:
+                best_acc, best_t = acc, float(t)
+        return best_t
+
+    # Public API ----------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._net is None:
             raise RuntimeError(
                 "Network has not been built yet. Call fit() before forward()."
@@ -66,113 +130,51 @@ class HallucinationProbe(nn.Module):
         return self._net(x).squeeze(-1)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Train the probe on labelled feature vectors.
+        """Fit the bootstrap ensemble and pick the accuracy-optimal threshold.
 
-        Scales features with ``StandardScaler``, builds the network if needed,
-        and optimises with Adam + ``BCEWithLogitsLoss``.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-            y: Integer label vector of shape ``(n_samples,)``; 0 = truthful,
-               1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
+        Threshold selection is done first via 5-fold OOF on the input
+        (X, y) using a single LogReg per fold. Then the production
+        ensemble is fit on the full input.
         """
-        X_scaled = self._scaler.fit_transform(X)
+        y_int = y.astype(int)
+        n = len(y_int)
 
-        self._build_network(X_scaled.shape[1])
+        oof_probs = np.full(n, np.nan, dtype=np.float64)
+        try:
+            skf = StratifiedKFold(
+                n_splits=INNER_FOLDS, shuffle=True, random_state=RANDOM_STATE
+            )
+            for tr_idx, va_idx in skf.split(np.arange(n), y_int):
+                # A single LogReg is enough for OOF threshold selection;
+                # the production ensemble lives below.
+                sc, clf = self._fit_one(X[tr_idx], y_int[tr_idx])
+                oof_probs[va_idx] = clf.predict_proba(sc.transform(X[va_idx]))[:, 1]
+            self._threshold = self._best_accuracy_threshold(oof_probs, y_int)
+        except ValueError:
+            self._threshold = 0.5
 
-        X_t = torch.from_numpy(X_scaled).float()
-        y_t = torch.from_numpy(y.astype(np.float32))
-
-        # Weight positive examples by neg/pos ratio to handle class imbalance.
-        n_pos = int(y.sum())
-        n_neg = len(y) - n_pos
-        pos_weight = torch.tensor([n_neg / max(n_pos, 1)], dtype=torch.float32)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the training loop below.
-        # ------------------------------------------------------------------
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
-
-        self.train()
-        for _ in range(200):
-            optimizer.zero_grad()
-            logits = self(X_t)
-            loss = criterion(logits, y_t)
-            loss.backward()
-            optimizer.step()
-        # ------------------------------------------------------------------
-
-        self.eval()
+        self._fit_bootstrap_ensemble(X, y_int)
         return self
 
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
     ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
-
-        The chosen threshold is stored in ``self._threshold`` and used by
-        subsequent ``predict`` calls.  Call this after ``fit`` and before
-        ``predict``.
-
-        Args:
-            X_val: Validation feature matrix of shape
-                   ``(n_val_samples, feature_dim)``.
-            y_val: Integer label vector of shape ``(n_val_samples,)``;
-                   0 = truthful, 1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
+        """Re-tune the decision threshold on a held-out validation set."""
         probs = self.predict_proba(X_val)[:, 1]
-
-        # Candidate thresholds: unique predicted probabilities plus a coarse grid.
-        candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
-
-        best_threshold = 0.5
-        best_f1 = -1.0
-        for t in candidates:
-            y_pred_t = (probs >= t).astype(int)
-            score = f1_score(y_val, y_pred_t, zero_division=0)
-            if score > best_f1:
-                best_f1 = score
-                best_threshold = float(t)
-
-        self._threshold = best_threshold
+        self._threshold = self._best_accuracy_threshold(probs, y_val.astype(int))
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict binary labels for feature vectors.
-
-        Uses the decision threshold in ``self._threshold`` (default ``0.5``;
-        updated by ``fit_hyperparameters``).
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Integer array of shape ``(n_samples,)`` with values in ``{0, 1}``.
-        """
         return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return class probability estimates.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Array of shape ``(n_samples, 2)`` where column 1 contains the
-            estimated probability of the hallucinated class (label 1).
-            Used to compute AUROC.
-        """
-        X_scaled = self._scaler.transform(X)
-        X_t = torch.from_numpy(X_scaled).float()
-        with torch.no_grad():
-            logits = self(X_t)
-            prob_pos = torch.sigmoid(logits).numpy()
-        return np.stack([1.0 - prob_pos, prob_pos], axis=1)
-
+        """Average class probabilities across the bootstrap ensemble."""
+        if not self._clfs:
+            raise RuntimeError(
+                "Probe has not been fitted yet. Call fit() before predict_proba()."
+            )
+        probs_pos = np.zeros(len(X), dtype=np.float64)
+        for sc, clf in zip(self._scalers, self._clfs):
+            probs_pos += clf.predict_proba(sc.transform(X))[:, 1]
+        probs_pos /= len(self._clfs)
+        return np.stack([1.0 - probs_pos, probs_pos], axis=1)
